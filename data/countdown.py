@@ -2,6 +2,7 @@
 Countdown dataset generation, solving, and search trajectories.
 Consolidated single-file implementation containing utilities, search algorithms, and generation script.
 """
+# Thanks to @JaydenTeoh for the code
 
 import os
 import re
