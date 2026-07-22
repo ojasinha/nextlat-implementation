@@ -8,12 +8,11 @@ import sys
 import re
 import json
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 
 TEST_FILE = "data/countdown/val_target_b4_t100_n500000.txt" # Evaluation test set
+TEST_SET_LIMIT = 10000
 MAX_INTERMEDIATE = 9856
 NUM_PAUSE_TOKENS = 8
 
@@ -228,6 +227,7 @@ def main():
         
     with open(TEST_FILE, "r") as f:
         lines = [line.strip() for line in f if line.strip()]
+    lines = lines[:TEST_SET_LIMIT]
     print(f"Loaded {len(lines)} test lines from {TEST_FILE}")
     
     # Initialize Model Config & Weights

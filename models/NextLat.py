@@ -13,10 +13,10 @@ class NextLatConfig:
     n_head: int = 12
     n_embd: int = 768
     # NextLat hyperparameters
-    proj_factor: int = 1.0
-    lambda_next_h: float = 1.0
+    lambda_next_h: float = 2.0
     lambda_kl: float = 1.0
     bias: bool = False
+    proj_factor: float = 0.5
 
 class LatentDynamicsModel(nn.Module):
     def __init__(self, config):

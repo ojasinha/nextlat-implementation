@@ -7,7 +7,6 @@ import os
 import sys
 import time
 import random
-import math
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -24,19 +23,19 @@ N_EMBD = 768
 BLOCK_SIZE = 32         # Max sequence length for positional embeddings
 
 # Optimization & Training
-MAX_STEPS = 2500        # Total number of training steps
+MAX_STEPS = 100000        # Total number of training steps
 VAL_INTERVAL = 100       # Evaluate validation loss every VAL_INTERVAL steps
 VAL_STEPS = 20           # Number of validation batches to run for evaluation
-WARMUP_STEPS = 500        # Cosine scheduler warmup steps
 BATCH_SIZE = 1024
-MICRO_BATCH_SIZE = 64
+MICRO_BATCH_SIZE = 128
 ACCUMULATION_STEPS = BATCH_SIZE // MICRO_BATCH_SIZE
 LEARNING_RATE = 3e-4
 SEED = 108
 
 # NextLat specific weights
-LAMBDA_NEXT_H = 1.0
+LAMBDA_NEXT_H = 2.0
 LAMBDA_KL = 1.0
+PROJ_FACTOR = 0.5
 
 SAVE_DIR = "checkpoints"
 
@@ -200,244 +199,222 @@ def infinite_iter(dataloader):
             yield batch
 
 
-def get_lr(it, max_lr, min_lr, warmup_steps, max_steps):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it + 1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+if len(sys.argv) < 2 or sys.argv[1] not in ["gpt", "nextlat"]:
+    print("Usage: python train_countdown.py [gpt|nextlat]")
+    sys.exit(1)
+    
+model_type = sys.argv[1]
 
+# Seeds
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Device: {device} | Model Type: {model_type}")
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ["gpt", "nextlat"]:
-        print("Usage: python train_countdown.py [gpt|nextlat]")
-        sys.exit(1)
-        
-    model_type = sys.argv[1]
+if device == "cuda":
+    torch.set_float32_matmul_precision('high')
     
-    # Seeds
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-        
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device} | Model Type: {model_type}")
-    
-    if device == "cuda":
-        torch.set_float32_matmul_precision('high')
-        
-    device_type = "cuda" if "cuda" in device else "cpu"
-    ptdtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-    
-    # Tokenizer & Dataloaders
-    tokenizer = Tokenizer(max_intermediate=MAX_INTERMEDIATE)
-    
-    train_dataset = CountdownDataset(TRAIN_FILE, tokenizer, NUM_PAUSE_TOKENS)
-    train_loader = DataLoader(
-        train_dataset,
+device_type = "cuda" if "cuda" in device else "cpu"
+ptdtype = torch.bfloat16
+
+# Tokenizer & Dataloaders
+tokenizer = Tokenizer(max_intermediate=MAX_INTERMEDIATE)
+
+train_dataset = CountdownDataset(TRAIN_FILE, tokenizer, NUM_PAUSE_TOKENS)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=MICRO_BATCH_SIZE,
+    shuffle=True,
+    collate_fn=lambda b: collate_fn(b, tokenizer.eos_token_id)
+)
+train_iter = infinite_iter(train_loader)
+
+val_loader = None
+if os.path.exists(VAL_FILE):
+    val_dataset = CountdownDataset(VAL_FILE, tokenizer, NUM_PAUSE_TOKENS)
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=MICRO_BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,
         collate_fn=lambda b: collate_fn(b, tokenizer.eos_token_id)
     )
-    train_iter = infinite_iter(train_loader)
-    
-    val_loader = None
-    if os.path.exists(VAL_FILE):
-        val_dataset = CountdownDataset(VAL_FILE, tokenizer, NUM_PAUSE_TOKENS)
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=MICRO_BATCH_SIZE,
-            shuffle=False,
-            collate_fn=lambda b: collate_fn(b, tokenizer.eos_token_id)
-        )
-    else:
-        print(f"Warning: Validation file not found at {VAL_FILE}. Skipping validation evaluations, but checkpoints will still be saved.")
-    
-    # Model config & initialization
-    if model_type == "gpt":
-        config = GPTConfig(
-            block_size=BLOCK_SIZE,
-            vocab_size=tokenizer.vocab_size,
-            n_layer=N_LAYER,
-            n_head=N_HEAD,
-            n_embd=N_EMBD
-        )
-        model = GPT(config).to(device)
-    else:
-        config = NextLatConfig(
-            block_size=BLOCK_SIZE,
-            vocab_size=tokenizer.vocab_size,
-            n_layer=N_LAYER,
-            n_head=N_HEAD,
-            n_embd=N_EMBD,
-            lambda_next_h=LAMBDA_NEXT_H,
-            lambda_kl=LAMBDA_KL
-        )
-        model = NextLat(config).to(device)
-        
-    # Optimizer
-    optimizer = model.configure_optimizers(
-        weight_decay=0.1,
-        learning_rate=LEARNING_RATE,
-        device=device
+else:
+    print(f"Warning: Validation file not found at {VAL_FILE}. Skipping validation evaluations, but checkpoints will still be saved.")
+
+# Model config & initialization
+if model_type == "gpt":
+    config = GPTConfig(
+        block_size=BLOCK_SIZE,
+        vocab_size=tokenizer.vocab_size,
+        n_layer=N_LAYER,
+        n_head=N_HEAD,
+        n_embd=N_EMBD
     )
+    model = GPT(config).to(device)
+else:
+    config = NextLatConfig(
+        block_size=BLOCK_SIZE,
+        vocab_size=tokenizer.vocab_size,
+        n_layer=N_LAYER,
+        n_head=N_HEAD,
+        n_embd=N_EMBD,
+        lambda_next_h=LAMBDA_NEXT_H,
+        lambda_kl=LAMBDA_KL,
+        proj_factor=PROJ_FACTOR
+    )
+    model = NextLat(config).to(device)
     
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    best_val_loss = float("inf")
-    
-    # Initialize CSV log file
-    log_file_path = os.path.join(SAVE_DIR, f"log_{model_type}.csv")
-    with open(log_file_path, "w") as f:
-        if model_type == "gpt":
-            f.write("step,loss,lr,dt,val_loss\n")
-        else:
-            f.write("step,loss,loss_tok,loss_latent,loss_kl,lr,dt,val_loss\n")
-            
-    model.train()
-    
-    for step in range(1, MAX_STEPS + 1):
-        t0 = time.time()
-        val_loss_to_log = None
+# Optimizer
+optimizer = model.configure_optimizers(
+    weight_decay=0.1,
+    learning_rate=LEARNING_RATE,
+    device=device
+)
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+best_val_loss = float("inf")
+
+# Initialize CSV log file
+log_file_path = os.path.join(SAVE_DIR, f"log_{model_type}.csv")
+with open(log_file_path, "w") as f:
+    if model_type == "gpt":
+        f.write("step,loss,dt,val_loss\n")
+    else:
+        f.write("step,loss,loss_tok,loss_latent,loss_kl,dt,val_loss\n")
         
-        # Set learning rate for this step
-        lr = get_lr(step - 1, LEARNING_RATE, LEARNING_RATE * 0.1, WARMUP_STEPS, MAX_STEPS)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-            
-        optimizer.zero_grad()
+model.train()
+
+for step in range(1, MAX_STEPS + 1):
+    t0 = time.time()
+    val_loss_to_log = None
         
-        if model_type == "gpt":
-            loss_accum = 0.0
-            for micro_step in range(ACCUMULATION_STEPS):
-                x, y, loss_mask, latent_mask = next(train_iter)
-                x, y, loss_mask, latent_mask = (
-                    x.to(device),
-                    y.to(device),
-                    loss_mask.to(device),
-                    latent_mask.to(device)
+    optimizer.zero_grad()
+    
+    if model_type == "gpt":
+        loss_accum = 0.0
+        for micro_step in range(ACCUMULATION_STEPS):
+            x, y, loss_mask, latent_mask = next(train_iter)
+            x, y, loss_mask, latent_mask = (
+                x.to(device),
+                y.to(device),
+                loss_mask.to(device),
+                latent_mask.to(device)
+            )
+            with torch.autocast(device_type=device_type, dtype=ptdtype):
+                logits, loss = model(x, y, loss_mask=loss_mask)
+                loss_for_backprop = loss / ACCUMULATION_STEPS
+            loss_for_backprop.backward()
+            loss_accum += loss.detach().item()
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        
+        mean_loss = loss_accum / ACCUMULATION_STEPS
+        if step % 10 == 0 or step == 1:
+            print(f"step {step:4d} | loss: {mean_loss:.6f} | dt: {dt:.2f}ms")
+    else:
+        loss_accum = 0.0
+        loss_tok_accum = 0.0
+        loss_latent_accum = 0.0
+        loss_kl_accum = 0.0
+        for micro_step in range(ACCUMULATION_STEPS):
+            x, y, loss_mask, latent_mask = next(train_iter)
+            x, y, loss_mask, latent_mask = (
+                x.to(device),
+                y.to(device),
+                loss_mask.to(device),
+                latent_mask.to(device)
+            )
+            with torch.autocast(device_type=device_type, dtype=ptdtype):
+                logits, loss, loss_next_token, loss_next_h, loss_kl = model(
+                    x, y, loss_mask=loss_mask, latent_mask=None
                 )
-                with torch.autocast(device_type=device_type, dtype=ptdtype):
-                    logits, loss = model(x, y, loss_mask=loss_mask)
-                    loss_for_backprop = loss / ACCUMULATION_STEPS
-                loss_for_backprop.backward()
-                loss_accum += loss.detach().item()
+                loss_for_backprop = loss / ACCUMULATION_STEPS
+            loss_for_backprop.backward()
+            loss_accum += loss.detach().item()
+            loss_tok_accum += loss_next_token.detach().item()
+            loss_latent_accum += loss_next_h.detach().item()
+            loss_kl_accum += loss_kl.detach().item()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        
+        mean_loss = loss_accum / ACCUMULATION_STEPS
+        mean_loss_tok = loss_tok_accum / ACCUMULATION_STEPS
+        mean_loss_latent = loss_latent_accum / ACCUMULATION_STEPS
+        mean_loss_kl = loss_kl_accum / ACCUMULATION_STEPS
+        if step % 10 == 0 or step == 1:
+            print(
+                f"step {step:4d} | loss: {mean_loss:.6f} | "
+                f"loss_tok: {mean_loss_tok:.6f} | "
+                f"loss_latent: {mean_loss_latent:.6f} | "
+                f"loss_kl: {mean_loss_kl:.6f} | dt: {dt:.2f}ms"
+            )
             
-            t1 = time.time()
-            dt = (t1 - t0) * 1000
-            
-            mean_loss = loss_accum / ACCUMULATION_STEPS
-            if step % 10 == 0 or step == 1:
-                print(f"step {step:4d} | loss: {mean_loss:.6f} | lr: {lr:.4e} | dt: {dt:.2f}ms")
-        else:
-            loss_accum = 0.0
-            loss_tok_accum = 0.0
-            loss_latent_accum = 0.0
-            loss_kl_accum = 0.0
-            for micro_step in range(ACCUMULATION_STEPS):
-                x, y, loss_mask, latent_mask = next(train_iter)
-                x, y, loss_mask, latent_mask = (
-                    x.to(device),
-                    y.to(device),
-                    loss_mask.to(device),
-                    latent_mask.to(device)
-                )
-                with torch.autocast(device_type=device_type, dtype=ptdtype):
-                    logits, loss, loss_next_token, loss_next_h, loss_kl = model(
-                        x, y, loss_mask=loss_mask, latent_mask=None
+    # Infrequent Validation check
+    if step % VAL_INTERVAL == 0:
+        # Save latest checkpoint
+        checkpoint_path = os.path.join(SAVE_DIR, f"{model_type}_latest.pt")
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"--- step {step:4d} | saved checkpoint to {checkpoint_path} ---")
+        
+        if val_loader:
+            model.eval()
+            val_loss = 0.0
+            val_batches = 0
+            val_iter = iter(val_loader)
+            with torch.no_grad():
+                # Evaluate over similar amount of samples using ACCUMULATION_STEPS
+                for _ in range(VAL_STEPS * ACCUMULATION_STEPS):
+                    try:
+                        vx, vy, vloss_mask, vlatent_mask = next(val_iter)
+                    except StopIteration:
+                        val_iter = iter(val_loader)
+                        vx, vy, vloss_mask, vlatent_mask = next(val_iter)
+                        
+                    vx, vy, vloss_mask, vlatent_mask = (
+                        vx.to(device),
+                        vy.to(device),
+                        vloss_mask.to(device),
+                        vlatent_mask.to(device)
                     )
-                    loss_for_backprop = loss / ACCUMULATION_STEPS
-                loss_for_backprop.backward()
-                loss_accum += loss.detach().item()
-                loss_tok_accum += loss_next_token.detach().item()
-                loss_latent_accum += loss_next_h.detach().item()
-                loss_kl_accum += loss_kl.detach().item()
-                
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            t1 = time.time()
-            dt = (t1 - t0) * 1000
+                    
+                    if model_type == "gpt":
+                        with torch.autocast(device_type=device_type, dtype=ptdtype):
+                            _, loss = model(vx, vy, loss_mask=vloss_mask)
+                    else:
+                        with torch.autocast(device_type=device_type, dtype=ptdtype):
+                            _, loss, _, _, _ = model(
+                                vx, vy, loss_mask=vloss_mask, latent_mask=None
+                            )
+                    val_loss += loss.item()
+                    val_batches += 1
+                    
+            avg_val_loss = val_loss / val_batches
+            val_loss_to_log = avg_val_loss
+            print(f"--- step {step:4d} | validation loss: {avg_val_loss:.6f} ---")
             
-            mean_loss = loss_accum / ACCUMULATION_STEPS
-            mean_loss_tok = loss_tok_accum / ACCUMULATION_STEPS
-            mean_loss_latent = loss_latent_accum / ACCUMULATION_STEPS
-            mean_loss_kl = loss_kl_accum / ACCUMULATION_STEPS
-            if step % 10 == 0 or step == 1:
-                print(
-                    f"step {step:4d} | loss: {mean_loss:.6f} | "
-                    f"loss_tok: {mean_loss_tok:.6f} | "
-                    f"loss_latent: {mean_loss_latent:.6f} | "
-                    f"loss_kl: {mean_loss_kl:.6f} | lr: {lr:.4e} | dt: {dt:.2f}ms"
-                )
-                
-        # Infrequent Validation check
-        if step % VAL_INTERVAL == 0:
-            # Save latest checkpoint
-            checkpoint_path = os.path.join(SAVE_DIR, f"{model_type}_latest.pt")
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"--- step {step:4d} | saved checkpoint to {checkpoint_path} ---")
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_path = os.path.join(SAVE_DIR, f"{model_type}_best.pt")
+                torch.save(model.state_dict(), best_path)
+                print(f"New best validation loss! Saved checkpoints/{model_type}_best.pt")
+            model.train()
             
-            if val_loader:
-                model.eval()
-                val_loss = 0.0
-                val_batches = 0
-                val_iter = iter(val_loader)
-                with torch.no_grad():
-                    # Evaluate over similar amount of samples using ACCUMULATION_STEPS
-                    for _ in range(VAL_STEPS * ACCUMULATION_STEPS):
-                        try:
-                            vx, vy, vloss_mask, vlatent_mask = next(val_iter)
-                        except StopIteration:
-                            val_iter = iter(val_loader)
-                            vx, vy, vloss_mask, vlatent_mask = next(val_iter)
-                            
-                        vx, vy, vloss_mask, vlatent_mask = (
-                            vx.to(device),
-                            vy.to(device),
-                            vloss_mask.to(device),
-                            vlatent_mask.to(device)
-                        )
-                        
-                        if model_type == "gpt":
-                            with torch.autocast(device_type=device_type, dtype=ptdtype):
-                                _, loss = model(vx, vy, loss_mask=vloss_mask)
-                        else:
-                            with torch.autocast(device_type=device_type, dtype=ptdtype):
-                                _, loss, _, _, _ = model(
-                                    vx, vy, loss_mask=vloss_mask, latent_mask=None
-                                )
-                        val_loss += loss.item()
-                        val_batches += 1
-                        
-                avg_val_loss = val_loss / val_batches
-                val_loss_to_log = avg_val_loss
-                print(f"--- step {step:4d} | validation loss: {avg_val_loss:.6f} ---")
-                
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    best_path = os.path.join(SAVE_DIR, f"{model_type}_best.pt")
-                    torch.save(model.state_dict(), best_path)
-                    print(f"New best validation loss! Saved checkpoints/{model_type}_best.pt")
-                model.train()
-                
-        # Log metrics to CSV
-        val_loss_str = f"{val_loss_to_log:.6f}" if val_loss_to_log is not None else ""
-        with open(log_file_path, "a") as f:
-            if model_type == "gpt":
-                f.write(f"{step},{mean_loss:.6f},{lr:.6e},{dt:.2f},{val_loss_str}\n")
-            else:
-                f.write(f"{step},{mean_loss:.6f},{mean_loss_tok:.6f},{mean_loss_latent:.6f},{mean_loss_kl:.6f},{lr:.6e},{dt:.2f},{val_loss_str}\n")
-
-
-if __name__ == "__main__":
-    main()
+    # Log metrics to CSV
+    val_loss_str = f"{val_loss_to_log:.6f}" if val_loss_to_log is not None else ""
+    with open(log_file_path, "a") as f:
+        if model_type == "gpt":
+            f.write(f"{step},{mean_loss:.6f},{dt:.2f},{val_loss_str}\n")
+        else:
+            f.write(f"{step},{mean_loss:.6f},{mean_loss_tok:.6f},{mean_loss_latent:.6f},{mean_loss_kl:.6f},{dt:.2f},{val_loss_str}\n")
